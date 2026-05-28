@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import hashlib
-import http
 import json
 import os
 import re
@@ -59,9 +58,9 @@ _ARCH_CONTENT_RE = re.compile(
 )
 _XML_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
 
-_HOT_RELOAD_EXTENSIONS = {".js", ".css", ".scss", ".svg"}
+_LIVE_RELOAD_EXTENSIONS = {".js", ".css", ".scss", ".svg"}
 _RESTART_EXTENSIONS = {".py"}
-_TRACKED_EXTENSIONS = _RESTART_EXTENSIONS | _HOT_RELOAD_EXTENSIONS | {".xml"}
+_TRACKED_EXTENSIONS = _RESTART_EXTENSIONS | _LIVE_RELOAD_EXTENSIONS | {".xml"}
 _IGNORE_PATTERNS = ["*/__pycache__/*", "*/.git/*", "*/node_modules/*", "*/documentation/*", "*/i18n/*"]
 
 def read(path: str) -> str:
@@ -94,6 +93,43 @@ def file_hash(path: str) -> str:
             return hashlib.sha1(f.read()).hexdigest()
     except OSError:
         return ""
+
+def get_odoo_major_version(odoo_path):
+    odoo_dir = os.path.expanduser(odoo_path)
+    if not os.path.isdir(odoo_dir):
+        sys.exit(f"[watcher] Odoo path not found: {odoo_dir}")
+
+    git_head_path = odoo_dir + "/.git/HEAD"
+    with open(git_head_path, 'r') as file:
+        file_content = file.read()
+
+    match = re.search(r'(\d+)\.\d+', file_content)
+    return int(match.group(1)) if match else 19
+
+def get_values_from_cmd(cmd: str) -> tuple | None:
+    port_match = re.search(r'(?:-p|--http-port)\s+(\S+)', cmd)
+    port = port_match.group(1) if port_match else 8069
+
+    db_match = re.search(r'(?:-d|--database)\s+(\S+)', cmd)
+    db_name = db_match.group(1) if db_match else None
+
+    modules_i_match = re.search(r'(?:-i|--init)\s+(\S+)', cmd)
+    modules_u_match = re.search(r'(?:-u|--update)\s+(\S+)', cmd)
+    modules_r_match = re.search(r'(?:--reinit)\s+(\S+)', cmd)
+
+    modules = ",".join(filter(None, [
+        modules_i_match.group(1) if modules_i_match else None,
+        modules_u_match.group(1) if modules_u_match else None,
+        modules_r_match.group(1) if modules_r_match else None,
+    ])) or None
+
+    return (port, db_name, modules)
+
+def strip_module_flags(cmd: str) -> str:
+    cmd = re.sub(r'(?:-i|--init)\s+\S+', '', cmd)
+    cmd = re.sub(r'(?:-u|--update)\s+\S+', '', cmd)
+    cmd = re.sub(r'--reinit\s+\S+', '', cmd)
+    return ' '.join(cmd.split())  # normalize extra whitespace
 
 def resolve_module_flag(db_name: str, modules: str, version: int) -> str:
     """
@@ -162,7 +198,7 @@ def resolve_module_flag(db_name: str, modules: str, version: int) -> str:
 
 # ── LiveReload server ──────────────────────────────────────────────────────────
 
-class HotReload:
+class LiveReload:
     HELLO = json.dumps({
         "command": "hello",
         "protocols": ["http://livereload.com/protocols/official-7"],
@@ -204,7 +240,7 @@ class HotReload:
                 if not handshake:
                     handshake = True
                     if not self._reconnecting:
-                        log(f"Hot reload client connected ({len(self._clients)} in total)", Color.CYAN)
+                        log(f"Live reload client connected ({len(self._clients)} in total)", Color.CYAN)
                     self._reconnecting = False
         finally:
             self._clients.discard(ws)
@@ -212,7 +248,7 @@ class HotReload:
                 if ws.close_code == 1001:
                     self._reconnecting = True
                 else:
-                    log(f"Hot reload client disconnected ({len(self._clients)} remaining)", Color.DIM)
+                    log(f"Live reload client disconnected ({len(self._clients)} remaining)", Color.DIM)
 
     def _run(self):
         self._loop = asyncio.new_event_loop()
@@ -228,13 +264,12 @@ class HotReload:
 # ── Odoo runner ────────────────────────────────────────────────────────────────
 
 class OdooRunner:
-    def __init__(self, command: str, reloader: HotReload, odoo_port: int, db_name: str = "", modules: str = "", version: int = 19):
+    def __init__(self, command: str, reloader: LiveReload, odoo_path: str):
         self.command = command
         self.reloader = reloader
-        self.odoo_port = odoo_port
-        self.db_name = db_name
-        self.modules = modules
-        self.version = version
+        self.odoo_port, self.db_name, self.modules = get_values_from_cmd(self.command)
+        self.odoo_path = odoo_path
+        self.version = get_odoo_major_version(self.odoo_path)
         self._process: subprocess.Popen | None = None
         self._stop_poll = threading.Event()
         self.is_restarting = False
@@ -271,7 +306,7 @@ class OdooRunner:
     def _spawn(self) -> subprocess.Popen:
         cmd = self.command
         if self.db_name and self.modules:
-            cmd += " " + resolve_module_flag(self.db_name, self.modules, self.version)
+            cmd = f"cd {self.odoo_path} && {strip_module_flags(self.command)} {resolve_module_flag(self.db_name, self.modules, self.version)}"
         process = subprocess.Popen(
             cmd,
             shell=True,
@@ -317,7 +352,7 @@ class OdooRunner:
 # ── Watchdog handler ───────────────────────────────────────────────────────────
 
 class Manager(PatternMatchingEventHandler):
-    def __init__(self, runner: OdooRunner, reloader: HotReload, debounce: float):
+    def __init__(self, runner: OdooRunner, reloader: LiveReload, debounce: float):
         super().__init__(
             patterns=[f"*{ext}" for ext in _TRACKED_EXTENSIONS],
             ignore_patterns=_IGNORE_PATTERNS,
@@ -372,7 +407,7 @@ class Manager(PatternMatchingEventHandler):
             self._schedule("restart" if xml_diff(old_snapshot, new_snapshot) else "reload", path)
         elif extension in _RESTART_EXTENSIONS:
             self._schedule("restart", path)
-        elif extension in _HOT_RELOAD_EXTENSIONS:
+        elif extension in _LIVE_RELOAD_EXTENSIONS:
             self._schedule("reload", path)
 
     def _schedule(self, action: str, path: str) -> None:
@@ -388,7 +423,7 @@ class Manager(PatternMatchingEventHandler):
                     self.runner.is_restarting = True
                     log("Restarting server: change detected in %s." % file_name, Color.YELLOW)
                 elif self.reloader.is_active():
-                    log("Hot reload: change detected in %s." % file_name, Color.CYAN)
+                    log("Live reload: change detected in %s." % file_name, Color.CYAN)
 
             self._timer = threading.Timer(self._debounce, self._fire, args=(action, path))
             self._timer.daemon = True
@@ -411,37 +446,29 @@ class Manager(PatternMatchingEventHandler):
 
 def main():
     ap = argparse.ArgumentParser(description="odoo-watch — auto-restart on module changes")
-    ap.add_argument("--db-name", required=True, metavar="DB")
+    ap.add_argument("--cmd", required=True, metavar="CMD")
+    ap.add_argument("--odoo-path", required=True, metavar="ODIR")
+    ap.add_argument("--watch-path", required=True, nargs="+", metavar="WDIR")
     ap.add_argument("--debounce", type=float, default=1, metavar="SEC")
-    ap.add_argument("--modules", default="", metavar="MOD")
-    ap.add_argument("--launch", required=True, metavar="CMD")
-    ap.add_argument("--odoo-port", type=int, default=8069, metavar="PORT")
     ap.add_argument("--reload-port", type=int, default=35729, metavar="PORT")
-    ap.add_argument("--version", type=int, default=19, metavar="V")
-    ap.add_argument("--watch", required=True, nargs="+", metavar="DIR")
     args = ap.parse_args()
 
-    for d in args.watch:
-        if not os.path.isdir(d):
-            sys.exit(f"[watcher] Watch path not found: {d}")
+    for d in args.watch_path:
+        expanded_d = os.path.expanduser(d)
+        if not os.path.isdir(expanded_d):
+            sys.exit(f"[watcher] Watch path not found: {expanded_d}")
 
-    reloader = HotReload(args.reload_port)
-    runner = OdooRunner(
-        args.launch,
-        reloader,
-        args.odoo_port,
-        db_name=args.db_name,
-        modules=args.modules,
-        version=args.version,
-    )
+    reloader = LiveReload(args.reload_port)
+    runner = OdooRunner(args.cmd, reloader, args.odoo_path)
     manager = Manager(runner, reloader, args.debounce)
 
     observer = Observer()
-    for watch_dir in args.watch:
-        for f in Path(watch_dir).rglob("*"):
+    for watch_dir in args.watch_path:
+        expanded_dir = os.path.expanduser(watch_dir)
+        for f in Path(expanded_dir).rglob("*"):
             if f.suffix in _TRACKED_EXTENSIONS:
                 manager.track(str(f))
-        observer.schedule(manager, watch_dir, recursive=True)
+        observer.schedule(manager, expanded_dir, recursive=True)
 
     observer.start()
     manager.start()
