@@ -6,6 +6,7 @@ import threading
 from watchdog.events import PatternMatchingEventHandler
 
 from common import Color, log
+from livereload import LiveReload
 from rpc import OdooRPC
 
 # Classifies each changed .xml file as either a no-op (arch/template body edit
@@ -34,8 +35,8 @@ _ARCH_CONTENT_RE = re.compile(
 _XML_COMMENT_RE = re.compile(r'<!--.*?-->', re.DOTALL)
 
 ASSET_EXTENSIONS = {".js", ".css", ".scss", ".svg"}  # served live by --dev=xml, no action needed
-# TRACKED_EXTENSIONS = ASSET_EXTENSIONS | {".xml"}  # .py is Odoo's own --dev=reload watcher's job
-TRACKED_EXTENSIONS = {".xml"}  # .py is Odoo's own --dev=reload watcher's job
+TRACKED_EXTENSIONS = ASSET_EXTENSIONS | {".xml"}  # .py is Odoo's own --dev=reload watcher's job
+# TRACKED_EXTENSIONS = {".xml"}  # .py is Odoo's own --dev=reload watcher's job
 _IGNORE_PATTERNS = ["*/__pycache__/*", "*/.git/*", "*/node_modules/*", "*/documentation/*", "*/i18n/*"]
 
 def read(path: str) -> str:
@@ -80,7 +81,7 @@ def owning_module(path: str, module_dirs: dict[str, str]) -> str | None:
 # ── Watchdog handler ───────────────────────────────────────────────────────────
 
 class Manager(PatternMatchingEventHandler):
-    def __init__(self, rpc: OdooRPC, debounce: float, module_dirs: dict[str, str]):
+    def __init__(self, rpc: OdooRPC, reloader: LiveReload, debounce: float, module_dirs: dict[str, str]):
         super().__init__(
             patterns=[f"*{ext}" for ext in TRACKED_EXTENSIONS],
             ignore_patterns=_IGNORE_PATTERNS,
@@ -88,6 +89,7 @@ class Manager(PatternMatchingEventHandler):
             case_sensitive=False,
         )
         self.rpc = rpc
+        self.reloader = reloader
         self.module_dirs = module_dirs
         self._debounce = debounce
         self._lock = threading.Lock()
@@ -98,7 +100,7 @@ class Manager(PatternMatchingEventHandler):
         self._xml: dict[str, dict] = {}
         self._hashes: dict[str, str] = {}
         self._pending_modules: set[str] = set()
-        # self._pending_no_action = False
+        self._pending_no_action = False
 
     def track(self, path: str) -> None:
         abs_path = os.path.abspath(path)
@@ -145,11 +147,18 @@ class Manager(PatternMatchingEventHandler):
                 else:
                     log(f"Couldn't resolve a module for {os.path.basename(path)} — "
                         f"skipping (is it under --watch-path, inside a module folder?)", Color.YELLOW)
+            else:
+                # Arch/template body only — Odoo's --dev=xml already serves this
+                # straight from disk, no RPC call needed, just tell the browser.
+                self._queue(no_action=True)
+        elif ext in ASSET_EXTENSIONS:
+            self._queue(no_action=True)
 
-    def _queue(self, module: str | None = None) -> None:
+    def _queue(self, module: str | None = None, no_action: bool = False) -> None:
         with self._lock:
             if module:
                 self._pending_modules.add(module)
+            self._pending_no_action = self._pending_no_action or no_action
             if self._timer:
                 self._timer.cancel()
             self._timer = threading.Timer(self._debounce, self._fire)
@@ -159,14 +168,20 @@ class Manager(PatternMatchingEventHandler):
     def _fire(self) -> None:
         with self._lock:
             modules = sorted(self._pending_modules)
+            no_action_only = self._pending_no_action and not modules
             self._pending_modules.clear()
+            self._pending_no_action = False
             self._timer = None
 
         with self._work_lock:
+            upgraded_any = False
             for module in modules:
                 try:
                     self.rpc.upgrade(module)
+                    upgraded_any = True
                 except Exception as e:
                     log(f"Failed to upgrade '{module}': {e}", Color.RED)
-            # if no_action_only:
-            #     log("Template/asset change detected — already served live by Odoo, nothing to do", Color.CYAN)
+            if no_action_only:
+                log("Asset change detected - Live reloading", Color.CYAN)
+            if upgraded_any or no_action_only:
+                self.reloader.reload("/")

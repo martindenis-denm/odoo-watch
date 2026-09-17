@@ -14,6 +14,12 @@ try:
 except ImportError:
     sys.exit("Missing dependency — run:  pip install watchdog")
 
+try:
+    import websockets  # noqa: F401 (livereload.py needs it; validated here for the friendly error)
+except ImportError:
+    sys.exit("Missing dependency — run:  pip install websockets")
+
+from livereload import LiveReload
 from manager import Manager, TRACKED_EXTENSIONS
 from rpc import OdooRPC
 from runner import OdooRunner
@@ -107,6 +113,7 @@ def main():
                           "module's current DB state, you don't pick -i/-u/--reinit yourself. "
                           "To resolve flags without starting anything, use resolve_modules.py instead.")
     ap.add_argument("--debounce", type=float, default=1, metavar="SEC")
+    ap.add_argument("--reload-port", type=int, default=35729, metavar="PORT")
     ap.add_argument("--rpc-login", default="admin", metavar="LOGIN")
     ap.add_argument("--rpc-password", default="admin", metavar="PASSWORD")
     args = ap.parse_args()
@@ -165,7 +172,10 @@ def main():
         rpc.wait_ready()
         rpc.update_module_list()
 
-        manager = Manager(rpc, args.debounce, module_dirs)
+        reloader = LiveReload(args.reload_port)
+        reloader.start()
+
+        manager = Manager(rpc, reloader, args.debounce, module_dirs)
         observer = Observer()
         for watch_dir in watch_dirs:
             for f in Path(watch_dir).rglob("*"):
